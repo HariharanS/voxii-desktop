@@ -190,6 +190,8 @@ function App() {
   const [status, setStatus] = useState("Idle");
   const [isRecording, setIsRecording] = useState(false);
   const [isSummarizing, setIsSummarizing] = useState(false);
+  const [isCleaningTranscript, setIsCleaningTranscript] = useState(false);
+  const [isEnhancingSelection, setIsEnhancingSelection] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
   const [selection, setSelection] = useState<SelectionState>({
@@ -200,6 +202,18 @@ function App() {
 
   const recorderRef = useRef<RecorderHandle | null>(null);
   const activeMeetingRef = useRef<string | null>(null);
+  const summaryStartRef = useRef<number | null>(null);
+  const summaryFirstTokenRef = useRef<boolean>(false);
+  const summaryBufferRef = useRef<string>("");
+  const enhanceBufferRef = useRef<string>("");
+  const enhanceContextRef = useRef<{
+    meetingId: string;
+    selectionId: string;
+    field: "notes" | "summary" | "transcript";
+    prefix: string;
+    suffix: string;
+  } | null>(null);
+  const cleanBufferRef = useRef<string>("");
   const notesRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLTextAreaElement | null>(null);
   const summaryRef = useRef<HTMLTextAreaElement | null>(null);
@@ -264,15 +278,14 @@ function App() {
           .filter(Boolean);
         if (names.length) {
           setModels(names);
-          if (!names.includes(selectedModel)) {
-            setSelectedModel(names[0]);
-          }
+          setSelectedModel((prev) => (names.includes(prev) ? prev : names[0]));
+          appendLog(`Models available (${names.length}): ${names.join(", ")}`);
         } else {
           setModels(getFallbackModels());
         }
       })
       .catch(() => setModels(getFallbackModels()));
-  }, [selectedModel]);
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -299,17 +312,34 @@ function App() {
       };
       if (!payload) return;
       if (payload.meetingId !== activeMeetingRef.current) return;
+      if (!summaryFirstTokenRef.current && payload.event.type === "delta") {
+        summaryFirstTokenRef.current = true;
+        if (summaryStartRef.current) {
+          const elapsed = Date.now() - summaryStartRef.current;
+          appendLog(`UI: first summary token after ${elapsed}ms.`);
+        }
+      }
       if (payload.event.type === "delta") {
+        const next = summaryBufferRef.current + (payload.event.content ?? "");
+        summaryBufferRef.current = next;
+        if (summaryRef.current) {
+          summaryRef.current.value = next;
+        }
         updateActiveMeeting((meeting) => ({
           ...meeting,
-          summary: meeting.summary + (payload.event.content ?? ""),
+          summary: next,
           updatedAt: new Date().toISOString(),
         }));
       }
       if (payload.event.type === "final") {
+        const finalText = payload.event.content ?? summaryBufferRef.current;
+        summaryBufferRef.current = finalText;
+        if (summaryRef.current) {
+          summaryRef.current.value = finalText;
+        }
         updateActiveMeeting((meeting) => ({
           ...meeting,
-          summary: payload.event.content ?? meeting.summary,
+          summary: finalText,
           updatedAt: new Date().toISOString(),
         }));
       }
@@ -327,7 +357,12 @@ function App() {
         }
         setIsSummarizing(false);
         setStatus("Idle");
-        appendLog("Summary complete.");
+        if (summaryStartRef.current) {
+          const elapsed = Date.now() - summaryStartRef.current;
+          appendLog(`Summary complete after ${elapsed}ms.`);
+        } else {
+          appendLog("Summary complete.");
+        }
       }
     });
 
@@ -336,6 +371,10 @@ function App() {
       setIsSummarizing(false);
       setStatus(message);
       appendLog(message);
+      if (summaryStartRef.current) {
+        const elapsed = Date.now() - summaryStartRef.current;
+        appendLog(`Summary failed after ${elapsed}ms.`);
+      }
     });
 
     const unlistenLog = listen("summary-log", (event) => {
@@ -345,11 +384,129 @@ function App() {
       }
     });
 
+    const unlistenEnhanceDelta = listen("enhance-delta", (event) => {
+      const payload = event.payload as {
+        meetingId: string;
+        selectionId: string;
+        event: { type: string; content?: string };
+      };
+      const context = enhanceContextRef.current;
+      if (!context) return;
+      if (payload?.meetingId !== context.meetingId) return;
+      if (payload?.selectionId !== context.selectionId) return;
+      if (payload.event.type === "delta") {
+        const next = enhanceBufferRef.current + (payload.event.content ?? "");
+        enhanceBufferRef.current = next;
+        const updated = context.prefix + next + context.suffix;
+        updateActiveMeeting((meeting) => ({
+          ...meeting,
+          [context.field]: updated,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      if (payload.event.type === "final") {
+        const finalText = payload.event.content ?? enhanceBufferRef.current;
+        enhanceBufferRef.current = finalText;
+        const updated = context.prefix + finalText + context.suffix;
+        updateActiveMeeting((meeting) => ({
+          ...meeting,
+          [context.field]: updated,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+    });
+
+    const unlistenEnhanceDone = listen("enhance-done", (event) => {
+      const payload = event.payload as {
+        meetingId: string;
+        selectionId: string;
+        text?: string | null;
+      };
+      const context = enhanceContextRef.current;
+      if (!context) return;
+      if (payload?.meetingId !== context.meetingId) return;
+      if (payload?.selectionId !== context.selectionId) return;
+      const finalText = payload.text ?? enhanceBufferRef.current;
+      const updated = context.prefix + finalText + context.suffix;
+      updateActiveMeeting((meeting) => ({
+        ...meeting,
+        [context.field]: updated,
+        updatedAt: new Date().toISOString(),
+      }));
+      setIsEnhancingSelection(false);
+      setStatus("Idle");
+      appendLog("Enhancement complete.");
+      enhanceContextRef.current = null;
+    });
+
+    const unlistenEnhanceError = listen("enhance-error", (event) => {
+      const message = String(event.payload ?? "Enhancement failed");
+      setIsEnhancingSelection(false);
+      setStatus(message);
+      appendLog(message);
+      enhanceContextRef.current = null;
+    });
+
+    const unlistenCleanDelta = listen("clean-transcript-delta", (event) => {
+      const payload = event.payload as {
+        meetingId: string;
+        event: { type: string; content?: string };
+      };
+      if (!payload) return;
+      if (payload.meetingId !== activeMeetingRef.current) return;
+      if (payload.event.type === "delta") {
+        const next = cleanBufferRef.current + (payload.event.content ?? "");
+        cleanBufferRef.current = next;
+        updateActiveMeeting((meeting) => ({
+          ...meeting,
+          transcript: next,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      if (payload.event.type === "final") {
+        const finalText = payload.event.content ?? cleanBufferRef.current;
+        cleanBufferRef.current = finalText;
+        updateActiveMeeting((meeting) => ({
+          ...meeting,
+          transcript: finalText,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+    });
+
+    const unlistenCleanDone = listen("clean-transcript-done", (event) => {
+      const payload = event.payload as { meetingId: string; text?: string | null };
+      if (payload?.meetingId !== activeMeetingRef.current) return;
+      if (payload?.text) {
+        updateActiveMeeting((meeting) => ({
+          ...meeting,
+          transcript: payload.text ?? meeting.transcript,
+          updatedAt: new Date().toISOString(),
+        }));
+      }
+      setIsCleaningTranscript(false);
+      setStatus("Idle");
+      appendLog("Transcript cleaned.");
+    });
+
+    const unlistenCleanError = listen("clean-transcript-error", (event) => {
+      const message = String(event.payload ?? "Transcript cleanup failed");
+      setIsCleaningTranscript(false);
+      setStatus(message);
+      appendLog(message);
+    });
+
     return () => {
       void unlistenDelta.then((fn) => fn());
       void unlistenDone.then((fn) => fn());
       void unlistenError.then((fn) => fn());
       void unlistenLog.then((fn) => fn());
+      void unlistenEnhanceDelta.then((fn) => fn());
+      void unlistenEnhanceDone.then((fn) => fn());
+      void unlistenEnhanceError.then((fn) => fn());
+      void unlistenCleanDelta.then((fn) => fn());
+      void unlistenCleanDone.then((fn) => fn());
+      void unlistenCleanError.then((fn) => fn());
     };
   }, []);
 
@@ -374,9 +531,11 @@ function App() {
   }
 
   function updateActiveMeeting(updater: (meeting: MeetingRecord) => MeetingRecord) {
+    const targetId = activeMeetingRef.current;
+    if (!targetId) return;
     setMeetings((prev) =>
       prev.map((meeting) =>
-        meeting.id === activeMeetingId ? updater(meeting) : meeting
+        meeting.id === targetId ? updater(meeting) : meeting
       )
     );
   }
@@ -407,21 +566,29 @@ function App() {
     const snippet = source.slice(start, end).trim();
     if (!snippet) return;
 
+    setIsEnhancingSelection(true);
     setStatus("Enhancing selection...");
     appendLog("Enhancing selected text...");
 
+    const selectionId = crypto.randomUUID();
+    const prefix = source.slice(0, start);
+    const suffix = source.slice(end);
+    enhanceBufferRef.current = "";
+    enhanceContextRef.current = {
+      meetingId: activeMeeting.id,
+      selectionId,
+      field: selection.field,
+      prefix,
+      suffix,
+    };
+
     try {
-      const enhanced = await invoke<string>("enhance_text", {
+      await invoke("start_enhance_stream", {
+        meetingId: activeMeeting.id,
+        selectionId,
         text: snippet,
         model: selectedModel,
       });
-      const updated = source.slice(0, start) + enhanced + source.slice(end);
-      updateActiveMeeting((meeting) => ({
-        ...meeting,
-        [selection.field as "notes" | "summary" | "transcript"]: updated,
-        updatedAt: new Date().toISOString(),
-      }));
-      setStatus("Idle");
     } catch (error) {
       const message =
         error instanceof Error
@@ -430,7 +597,38 @@ function App() {
             ? error
             : "Enhancement failed";
       setStatus(message);
+      setIsEnhancingSelection(false);
       appendLog(message);
+      enhanceContextRef.current = null;
+    }
+  }
+
+  async function handleCleanTranscript() {
+    if (!activeMeeting) return;
+    const source = activeMeeting.transcript.trim();
+    if (!source) return;
+
+    setIsCleaningTranscript(true);
+    setStatus("Cleaning transcript...");
+    appendLog("Cleaning transcript for accuracy...");
+    cleanBufferRef.current = "";
+
+    try {
+      await invoke("start_clean_transcript_stream", {
+        meetingId: activeMeeting.id,
+        text: source,
+        model: selectedModel,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Transcript cleanup failed";
+      setStatus(message);
+      appendLog(message);
+      setIsCleaningTranscript(false);
     }
   }
 
@@ -510,14 +708,20 @@ function App() {
       appendLog("Summary blocked: transcript and notes are empty.");
       return;
     }
-    setStatus("Enhancing notes...");
+    summaryStartRef.current = Date.now();
+    summaryFirstTokenRef.current = false;
+    summaryBufferRef.current = "";
+    setStatus("Generating summary...");
     setIsSummarizing(true);
-    appendLog("Streaming summary from Copilot SDK...");
+    appendLog("UI: invoking summary generation.");
     updateActiveMeeting((meeting) => ({
       ...meeting,
       summary: "",
       updatedAt: new Date().toISOString(),
     }));
+    if (summaryRef.current) {
+      summaryRef.current.value = "";
+    }
     try {
       await invoke("start_summary_stream", {
         meetingId: activeMeeting.id,
@@ -534,6 +738,10 @@ function App() {
             : "Summary generation failed";
       setStatus(message);
       appendLog(message);
+      if (summaryStartRef.current) {
+        const elapsed = Date.now() - summaryStartRef.current;
+        appendLog(`Summary invoke failed after ${elapsed}ms.`);
+      }
     }
   }
 
@@ -638,7 +846,7 @@ function App() {
               <button
                 className="ghost"
                 onClick={handleEnhanceSelection}
-                disabled={selection.field !== "notes"}
+                disabled={isEnhancingSelection || selection.field !== "notes"}
               >
                 Enhance selection
               </button>
@@ -665,8 +873,22 @@ function App() {
             <div className="panel-actions">
               <button
                 className="ghost"
+                onClick={handleCleanTranscript}
+                disabled={
+                  isCleaningTranscript ||
+                  isEnhancingSelection ||
+                  !activeMeeting?.transcript.trim()
+                }
+              >
+                {isCleaningTranscript ? "Cleaning..." : "Clean transcript"}
+              </button>
+              <button
+                className="ghost"
                 onClick={handleEnhanceSelection}
-                disabled={selection.field !== "transcript"}
+                disabled={
+                  isEnhancingSelection ||
+                  selection.field !== "transcript"
+                }
               >
                 Enhance selection
               </button>
@@ -687,12 +909,14 @@ function App() {
           />
         </section>
 
-        <section className="panel summary-panel">
+        <section
+          className={`panel summary-panel ${isSummarizing ? "summary-panel--loading" : ""}`}
+        >
           <div className="panel-header">
             <div>
               <h2>Summary</h2>
               {isSummarizing ? (
-                <span className="pill">Enhancing notes…</span>
+                <span className="pill">Generating summary…</span>
               ) : null}
             </div>
             <div className="panel-actions">
@@ -709,32 +933,50 @@ function App() {
               <button
                 className="primary"
                 onClick={handleGenerateSummary}
-                disabled={isSummarizing}
+                disabled={isSummarizing || isEnhancingSelection || isCleaningTranscript}
               >
                 Generate summary
               </button>
               <button
                 className="ghost"
                 onClick={handleEnhanceSelection}
-                disabled={selection.field !== "summary"}
+                disabled={
+                  isEnhancingSelection ||
+                  selection.field !== "summary"
+                }
               >
                 Enhance selection
               </button>
             </div>
           </div>
-          <textarea
-            ref={summaryRef}
-            value={activeMeeting?.summary ?? ""}
-            onChange={(event) =>
-              updateActiveMeeting((meeting) => ({
-                ...meeting,
-                summary: event.target.value,
-                updatedAt: new Date().toISOString(),
-              }))
-            }
-            onSelect={(event) => handleSelect("summary", event)}
-            placeholder="Summary will be generated here..."
-          />
+          <div
+            className={`summary-body ${isSummarizing ? "summary-body--loading" : ""}`}
+          >
+            <textarea
+              ref={summaryRef}
+              value={activeMeeting?.summary ?? ""}
+              onChange={(event) =>
+                updateActiveMeeting((meeting) => ({
+                  ...meeting,
+                  summary: event.target.value,
+                  updatedAt: new Date().toISOString(),
+                }))
+              }
+              onSelect={(event) => handleSelect("summary", event)}
+              placeholder="Summary will be generated here..."
+            />
+            {isSummarizing ? (
+              <div className="summary-stream" aria-hidden>
+                <span>Drafting insights</span>
+                <span className="summary-dots">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+                <span className="summary-caret" />
+              </div>
+            ) : null}
+          </div>
         </section>
 
         <section className={`panel diagnostics ${diagnosticsOpen ? "open" : ""}`}>

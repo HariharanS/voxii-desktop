@@ -11,7 +11,8 @@ const raw = await fs.readFile(inputPath, "utf-8");
 const cleaned = raw.replace(/^\uFEFF/, "").trim();
 const payload = JSON.parse(cleaned);
 
-const prompt = `Improve the selected text for clarity and concision while preserving meaning, names, numbers, and tone. Return only the improved text.\n\nSelected text:\n${payload.text}`;
+const transcript = payload.text?.trim() || "";
+const prompt = `You are a transcript editor. Fix obvious transcription errors, spelling mistakes, and missing punctuation while preserving meaning, names, and sentence order. Do NOT summarize or remove content. Keep the structure and line breaks similar. Return only the corrected transcript.\n\nTranscript:\n${transcript}`;
 
 const client = new CopilotClient();
 await client.start();

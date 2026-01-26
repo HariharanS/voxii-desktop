@@ -5,6 +5,7 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Instant,
 };
 use tauri::{Emitter, Manager};
 
@@ -40,79 +41,83 @@ struct MeetingRecord {
 }
 
 #[tauri::command]
-fn transcribe_audio(
+async fn transcribe_audio(
     app: tauri::AppHandle,
     audio_base64: String,
     language: Option<String>,
 ) -> Result<TranscribeResponse, String> {
-    let config = load_config(app.clone())?;
-    let whisper_path = resolve_whisper_path(&config.whisper_path)?;
-    let model_path = resolve_model_path(&config.model_path)?;
+    let config = load_config(app.clone()).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let whisper_path = resolve_whisper_path(&config.whisper_path)?;
+        let model_path = resolve_model_path(&config.model_path)?;
 
-    let audio_bytes = base64::engine::general_purpose::STANDARD
-        .decode(audio_base64)
-        .map_err(|err| format!("Failed to decode audio: {err}"))?;
+        let audio_bytes = base64::engine::general_purpose::STANDARD
+            .decode(audio_base64)
+            .map_err(|err| format!("Failed to decode audio: {err}"))?;
 
-    let temp_dir = std::env::temp_dir().join("voxii");
-    fs::create_dir_all(&temp_dir)
-        .map_err(|err| format!("Failed to create temp dir: {err}"))?;
+        let temp_dir = std::env::temp_dir().join("voxii");
+        fs::create_dir_all(&temp_dir)
+            .map_err(|err| format!("Failed to create temp dir: {err}"))?;
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let wav_path = temp_dir.join(format!("{id}.wav"));
-    let out_base = temp_dir.join(format!("{id}_out"));
+        let id = uuid::Uuid::new_v4().to_string();
+        let wav_path = temp_dir.join(format!("{id}.wav"));
+        let out_base = temp_dir.join(format!("{id}_out"));
 
-    fs::write(&wav_path, audio_bytes)
-        .map_err(|err| format!("Failed to write audio file: {err}"))?;
+        fs::write(&wav_path, audio_bytes)
+            .map_err(|err| format!("Failed to write audio file: {err}"))?;
 
-    let mut cmd = Command::new(&whisper_path);
-    cmd.arg("-m")
-        .arg(&model_path)
-        .arg("-f")
-        .arg(&wav_path)
-        .arg("-otxt")
-        .arg("-of")
-        .arg(&out_base);
+        let mut cmd = Command::new(&whisper_path);
+        cmd.arg("-m")
+            .arg(&model_path)
+            .arg("-f")
+            .arg(&wav_path)
+            .arg("-otxt")
+            .arg("-of")
+            .arg(&out_base);
 
-    let language = language.unwrap_or_else(|| config.language);
-    if !language.trim().is_empty() {
-        cmd.arg("-l").arg(language.trim());
-    }
+        let language = language.unwrap_or_else(|| config.language);
+        if !language.trim().is_empty() {
+            cmd.arg("-l").arg(language.trim());
+        }
 
-    let command_string = format!(
-        "\"{}\" -m \"{}\" -f \"{}\" -otxt -of \"{}\"",
-        whisper_path.display(),
-        model_path.display(),
-        wav_path.display(),
-        out_base.display()
-    );
+        let command_string = format!(
+            "\"{}\" -m \"{}\" -f \"{}\" -otxt -of \"{}\"",
+            whisper_path.display(),
+            model_path.display(),
+            wav_path.display(),
+            out_base.display()
+        );
 
-    let output = cmd
-        .output()
-        .map_err(|err| format!("Failed to run whisper: {err}"))?;
+        let output = cmd
+            .output()
+            .map_err(|err| format!("Failed to run whisper: {err}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    if !output.status.success() {
-        return Err(format!(
-            "Whisper failed (code {}).\nCommand: {}\nstdout: {}\nstderr: {}",
-            output.status.code().unwrap_or(-1),
-            command_string,
+        if !output.status.success() {
+            return Err(format!(
+                "Whisper failed (code {}).\nCommand: {}\nstdout: {}\nstderr: {}",
+                output.status.code().unwrap_or(-1),
+                command_string,
+                stdout,
+                stderr
+            ));
+        }
+
+        let transcript_path = out_base.with_extension("txt");
+        let transcript = fs::read_to_string(&transcript_path)
+            .map_err(|err| format!("Failed to read transcript: {err}"))?;
+
+        Ok(TranscribeResponse {
+            transcript,
             stdout,
-            stderr
-        ));
-    }
-
-    let transcript_path = out_base.with_extension("txt");
-    let transcript = fs::read_to_string(&transcript_path)
-        .map_err(|err| format!("Failed to read transcript: {err}"))?;
-
-    Ok(TranscribeResponse {
-        transcript,
-        stdout,
-        stderr,
-        command: command_string,
+            stderr,
+            command: command_string,
+        })
     })
+    .await
+    .map_err(|err| format!("Failed to run transcription task: {err}"))?
 }
 
 #[tauri::command]
@@ -137,7 +142,11 @@ fn diagnose_whisper(whisper_path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn generate_summary(transcript: String, notes: String) -> Result<String, String> {
+fn generate_summary(
+    transcript: String,
+    notes: String,
+    model: Option<String>,
+) -> Result<String, String> {
     let temp_dir = std::env::temp_dir().join("voxii");
     fs::create_dir_all(&temp_dir)
         .map_err(|err| format!("Failed to create temp dir: {err}"))?;
@@ -149,7 +158,7 @@ fn generate_summary(transcript: String, notes: String) -> Result<String, String>
         "transcript": transcript,
         "notes": notes,
         "sections": ["Agenda", "Summary", "Decisions", "Risks", "Actions"],
-        "model": "gpt-4.1"
+        "model": model.unwrap_or_else(|| "gpt-4.1".to_string())
     });
 
     fs::write(&input_path, payload.to_string())
@@ -181,7 +190,22 @@ fn generate_summary(transcript: String, notes: String) -> Result<String, String>
         ));
     }
 
-    Ok(stdout.trim().to_string())
+    let mut final_summary: Option<String> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.get("type").and_then(|v| v.as_str()) == Some("final") {
+                if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                    final_summary = Some(content.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(final_summary.unwrap_or_else(|| stdout.trim().to_string()))
 }
 
 #[tauri::command]
@@ -192,6 +216,7 @@ fn start_summary_stream(
     notes: String,
     model: String,
 ) -> Result<(), String> {
+    let start = Instant::now();
     let temp_dir = std::env::temp_dir().join("voxii");
     fs::create_dir_all(&temp_dir)
         .map_err(|err| format!("Failed to create temp dir: {err}"))?;
@@ -218,7 +243,12 @@ fn start_summary_stream(
     }
 
     tauri::async_runtime::spawn_blocking(move || {
+        let _ = app.emit(
+            "summary-log",
+            format!("Rust: starting summary process ({}ms)", start.elapsed().as_millis()),
+        );
         let mut child = match Command::new("node")
+            .env("STREAMING", "1")
             .arg(script_path)
             .arg(&input_path)
             .stdout(Stdio::piped())
@@ -246,6 +276,7 @@ fn start_summary_stream(
         }
 
         let mut final_summary: Option<String> = None;
+        let mut first_delta_emitted = false;
 
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
@@ -255,6 +286,16 @@ fn start_summary_stream(
                     continue;
                 }
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed) {
+                    if !first_delta_emitted {
+                        first_delta_emitted = true;
+                        let _ = app.emit(
+                            "summary-log",
+                            format!(
+                                "Rust: first stdout event at {}ms",
+                                start.elapsed().as_millis()
+                            ),
+                        );
+                    }
                     if value.get("type").and_then(|v| v.as_str()) == Some("final") {
                         if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
                             final_summary = Some(content.to_string());
@@ -290,35 +331,43 @@ fn start_summary_stream(
                 "summary": final_summary
             }),
         );
+        let _ = app.emit(
+            "summary-log",
+            format!("Rust: summary done at {}ms", start.elapsed().as_millis()),
+        );
     });
 
     Ok(())
 }
 
 #[tauri::command]
-fn list_models() -> Result<Vec<serde_json::Value>, String> {
-    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("scripts")
-        .join("copilot-models.mjs");
+async fn list_models() -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("copilot-models.mjs");
 
-    if !script_path.exists() {
-        return Err(format!("Models script not found: {}", script_path.display()));
-    }
+        if !script_path.exists() {
+            return Err(format!("Models script not found: {}", script_path.display()));
+        }
 
-    let output = Command::new("node")
-        .arg(script_path)
-        .output()
-        .map_err(|err| format!("Failed to run models script: {err}"))?;
+        let output = Command::new("node")
+            .arg(script_path)
+            .output()
+            .map_err(|err| format!("Failed to run models script: {err}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Model list failed: {stderr}\n{stdout}"));
-    }
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Model list failed: {stderr}\n{stdout}"));
+        }
 
-    let models = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim())
-        .map_err(|err| format!("Failed to parse models list: {err}"))?;
-    Ok(models)
+        let models = serde_json::from_str::<Vec<serde_json::Value>>(stdout.trim())
+            .map_err(|err| format!("Failed to parse models list: {err}"))?;
+        Ok(models)
+    })
+    .await
+    .map_err(|err| format!("Failed to run model list task: {err}"))?
 }
 
 #[tauri::command]
@@ -368,48 +417,336 @@ fn enhance_text(text: String, model: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn load_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
-    let path = config_path(&app)?;
-    if !path.exists() {
-        let default_config = AppConfig {
-            whisper_path: String::new(),
-            model_path: String::new(),
-            language: "en".to_string(),
-            include_system_audio: true,
-            default_model: "gpt-4.1".to_string(),
+fn start_enhance_stream(
+    app: tauri::AppHandle,
+    meeting_id: String,
+    selection_id: String,
+    text: String,
+    model: String,
+) -> Result<(), String> {
+    let temp_dir = std::env::temp_dir().join("voxii");
+    fs::create_dir_all(&temp_dir)
+        .map_err(|err| format!("Failed to create temp dir: {err}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let input_path = temp_dir.join(format!("{id}_enhance.json"));
+
+    let payload = serde_json::json!({
+        "text": text,
+        "model": model
+    });
+
+    fs::write(&input_path, payload.to_string())
+        .map_err(|err| format!("Failed to write enhance payload: {err}"))?;
+
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("copilot-enhance.mjs");
+
+    if !script_path.exists() {
+        return Err(format!("Enhance script not found: {}", script_path.display()));
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut child = match Command::new("node")
+            .env("STREAMING", "1")
+            .arg(script_path)
+            .arg(&input_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = app.emit(
+                    "enhance-error",
+                    format!("Failed to start Copilot SDK: {err}"),
+                );
+                return;
+            }
         };
-        save_config(&path, &default_config)?;
-        return Ok(default_config);
-    }
 
-    let raw = fs::read_to_string(&path)
-        .map_err(|err| format!("Failed to read config: {err}"))?;
-    let config = serde_json::from_str::<AppConfig>(&raw)
-        .map_err(|err| format!("Failed to parse config: {err}"))?;
-    Ok(config)
-}
+        if let Some(stderr) = child.stderr.take() {
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let _ = app_handle.emit("summary-log", line);
+                }
+            });
+        }
 
-#[tauri::command]
-fn load_meetings(app: tauri::AppHandle) -> Result<Vec<MeetingRecord>, String> {
-    let path = meetings_path(&app)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|err| format!("Failed to read meetings: {err}"))?;
-    let meetings = serde_json::from_str::<Vec<MeetingRecord>>(&raw)
-        .map_err(|err| format!("Failed to parse meetings: {err}"))?;
-    Ok(meetings)
-}
+        let mut final_text: Option<String> = None;
 
-#[tauri::command]
-fn save_meetings(app: tauri::AppHandle, meetings: Vec<MeetingRecord>) -> Result<(), String> {
-    let path = meetings_path(&app)?;
-    let payload = serde_json::to_string_pretty(&meetings)
-        .map_err(|err| format!("Failed to serialize meetings: {err}"))?;
-    fs::write(path, payload)
-        .map_err(|err| format!("Failed to save meetings: {err}"))?;
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim_end().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed) {
+                    if value.get("type").and_then(|v| v.as_str()) == Some("final") {
+                        if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                            final_text = Some(content.to_string());
+                        }
+                    }
+
+                    let payload = serde_json::json!({
+                        "meetingId": meeting_id,
+                        "selectionId": selection_id,
+                        "event": value
+                    });
+                    let _ = app.emit("enhance-delta", payload);
+                } else {
+                    let _ = app.emit("summary-log", trimmed);
+                }
+            }
+        }
+
+        let output = child.wait_with_output();
+        if let Ok(output) = output {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _ = app.emit(
+                    "enhance-error",
+                    format!("Copilot SDK failed: {stderr}"),
+                );
+            }
+        }
+
+        let _ = app.emit(
+            "enhance-done",
+            serde_json::json!({
+                "meetingId": meeting_id,
+                "selectionId": selection_id,
+                "text": final_text
+            }),
+        );
+    });
+
     Ok(())
+}
+
+#[tauri::command]
+fn clean_transcript(text: String, model: String) -> Result<String, String> {
+    let temp_dir = std::env::temp_dir().join("voxii");
+    fs::create_dir_all(&temp_dir)
+        .map_err(|err| format!("Failed to create temp dir: {err}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let input_path = temp_dir.join(format!("{id}_clean_transcript.json"));
+
+    let payload = serde_json::json!({
+        "text": text,
+        "model": model
+    });
+
+    fs::write(&input_path, payload.to_string())
+        .map_err(|err| format!("Failed to write transcript payload: {err}"))?;
+
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("copilot-clean-transcript.mjs");
+
+    if !script_path.exists() {
+        return Err(format!(
+            "Clean transcript script not found: {}",
+            script_path.display()
+        ));
+    }
+
+    let output = Command::new("node")
+        .arg(script_path)
+        .arg(&input_path)
+        .output()
+        .map_err(|err| format!("Failed to run Copilot SDK: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(format!(
+            "Copilot SDK failed (code {}).\nstdout: {}\nstderr: {}",
+            output.status.code().unwrap_or(-1),
+            stdout,
+            stderr
+        ));
+    }
+
+    Ok(stdout.trim().to_string())
+}
+
+#[tauri::command]
+fn start_clean_transcript_stream(
+    app: tauri::AppHandle,
+    meeting_id: String,
+    text: String,
+    model: String,
+) -> Result<(), String> {
+    let temp_dir = std::env::temp_dir().join("voxii");
+    fs::create_dir_all(&temp_dir)
+        .map_err(|err| format!("Failed to create temp dir: {err}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let input_path = temp_dir.join(format!("{id}_clean_transcript.json"));
+
+    let payload = serde_json::json!({
+        "text": text,
+        "model": model
+    });
+
+    fs::write(&input_path, payload.to_string())
+        .map_err(|err| format!("Failed to write transcript payload: {err}"))?;
+
+    let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("copilot-clean-transcript.mjs");
+
+    if !script_path.exists() {
+        return Err(format!(
+            "Clean transcript script not found: {}",
+            script_path.display()
+        ));
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut child = match Command::new("node")
+            .env("STREAMING", "1")
+            .arg(script_path)
+            .arg(&input_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = app.emit(
+                    "clean-transcript-error",
+                    format!("Failed to start Copilot SDK: {err}"),
+                );
+                return;
+            }
+        };
+
+        if let Some(stderr) = child.stderr.take() {
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    let _ = app_handle.emit("summary-log", line);
+                }
+            });
+        }
+
+        let mut final_text: Option<String> = None;
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim_end().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&trimmed) {
+                    if value.get("type").and_then(|v| v.as_str()) == Some("final") {
+                        if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                            final_text = Some(content.to_string());
+                        }
+                    }
+
+                    let payload = serde_json::json!({
+                        "meetingId": meeting_id,
+                        "event": value
+                    });
+                    let _ = app.emit("clean-transcript-delta", payload);
+                } else {
+                    let _ = app.emit("summary-log", trimmed);
+                }
+            }
+        }
+
+        let output = child.wait_with_output();
+        if let Ok(output) = output {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _ = app.emit(
+                    "clean-transcript-error",
+                    format!("Copilot SDK failed: {stderr}"),
+                );
+            }
+        }
+
+        let _ = app.emit(
+            "clean-transcript-done",
+            serde_json::json!({
+                "meetingId": meeting_id,
+                "text": final_text
+            }),
+        );
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn load_config(app: tauri::AppHandle) -> Result<AppConfig, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = config_path(&app)?;
+        if !path.exists() {
+            let default_config = AppConfig {
+                whisper_path: String::new(),
+                model_path: String::new(),
+                language: "en".to_string(),
+                include_system_audio: true,
+                default_model: "gpt-4.1".to_string(),
+            };
+            save_config(&path, &default_config)?;
+            return Ok(default_config);
+        }
+
+        let raw = fs::read_to_string(&path)
+            .map_err(|err| format!("Failed to read config: {err}"))?;
+        let config = serde_json::from_str::<AppConfig>(&raw)
+            .map_err(|err| format!("Failed to parse config: {err}"))?;
+        Ok(config)
+    })
+    .await
+    .map_err(|err| format!("Failed to load config task: {err}"))?
+}
+
+#[tauri::command]
+async fn load_meetings(app: tauri::AppHandle) -> Result<Vec<MeetingRecord>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = meetings_path(&app)?;
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let raw = fs::read_to_string(&path)
+            .map_err(|err| format!("Failed to read meetings: {err}"))?;
+        let meetings = serde_json::from_str::<Vec<MeetingRecord>>(&raw)
+            .map_err(|err| format!("Failed to parse meetings: {err}"))?;
+        Ok(meetings)
+    })
+    .await
+    .map_err(|err| format!("Failed to load meetings task: {err}"))?
+}
+
+#[tauri::command]
+async fn save_meetings(
+    app: tauri::AppHandle,
+    meetings: Vec<MeetingRecord>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = meetings_path(&app)?;
+        let payload = serde_json::to_string_pretty(&meetings)
+            .map_err(|err| format!("Failed to serialize meetings: {err}"))?;
+        fs::write(path, payload)
+            .map_err(|err| format!("Failed to save meetings: {err}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| format!("Failed to save meetings task: {err}"))?
 }
 
 fn resolve_whisper_path(input: &str) -> Result<PathBuf, String> {
@@ -470,6 +807,9 @@ pub fn run() {
             start_summary_stream,
             list_models,
             enhance_text,
+            start_enhance_stream,
+            clean_transcript,
+            start_clean_transcript_stream,
             load_config,
             load_meetings,
             save_meetings

@@ -27,37 +27,68 @@ const prompt = `You are a meeting assistant. Create a concise, structured summar
   .join("\n")}\n\nRules:\n- Use short bullet points\n- Be factual, no speculation\n- Keep names and numbers accurate\n- If a section has no content, write "- None"\n\nTranscript:\n${transcript}${notes}\n\nReturn only Markdown.`;
 
 const client = new CopilotClient();
+const startedAt = Date.now();
+const log = (message) => {
+  const elapsed = Date.now() - startedAt;
+  console.error(`[summary] +${elapsed}ms ${message}`);
+};
+log("init");
 await client.start();
+log("client.start complete");
 
+const streaming = process.env.STREAMING === "1";
+log(`createSession start (streaming=${streaming})`);
 const session = await client.createSession({
   model: payload.model || "gpt-4.1",
-  streaming: true,
+  ...(streaming ? { streaming: true } : {}),
 });
-
-let finalContent = "";
-const done = new Promise((resolve) => {
-  session.on((event) => {
-    if (event.type === "assistant.message_delta") {
-      const delta = event.data.deltaContent || "";
-      finalContent += delta;
-      process.stdout.write(
-        `${JSON.stringify({ type: "delta", content: delta })}\n`
-      );
-    } else if (event.type === "assistant.message") {
-      finalContent = event.data.content || finalContent;
-    } else if (event.type === "session.idle") {
-      process.stdout.write(
-        `${JSON.stringify({ type: "final", content: finalContent })}\n`
-      );
-      resolve();
-    }
-  });
-});
+log("createSession complete");
 
 try {
-  await session.send({ prompt });
-  await done;
+  if (streaming) {
+    let finalContent = "";
+    let sawFirstDelta = false;
+    const done = new Promise((resolve) => {
+      session.on((event) => {
+        if (event.type === "assistant.message_delta") {
+          const delta = event.data.deltaContent || "";
+          finalContent += delta;
+          if (!sawFirstDelta) {
+            sawFirstDelta = true;
+            log("first delta received");
+          }
+          process.stdout.write(
+            `${JSON.stringify({ type: "delta", content: delta })}\n`
+          );
+        } else if (event.type === "assistant.message") {
+          finalContent = event.data.content || finalContent;
+        } else if (event.type === "session.idle") {
+          log("session.idle received");
+          process.stdout.write(
+            `${JSON.stringify({ type: "final", content: finalContent })}\n`
+          );
+          resolve();
+        }
+      });
+    });
+
+    log("send start");
+    await session.send({ prompt });
+    log("send enqueued");
+    await done;
+  } else {
+    log("sendAndWait start");
+    const response = await session.sendAndWait({ prompt });
+    log("sendAndWait complete");
+    const content = response?.data?.content ?? "";
+    process.stdout.write(
+      `${JSON.stringify({ type: "final", content: content.trim() })}\n`
+    );
+  }
+
+  log("destroy session");
   await session.destroy();
+  log("client.stop");
   await client.stop();
 } catch (error) {
   await client.stop();
