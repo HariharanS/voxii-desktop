@@ -12,7 +12,36 @@ const cleaned = raw.replace(/^\uFEFF/, "").trim();
 const payload = JSON.parse(cleaned);
 
 const transcript = payload.text?.trim() || "";
-const prompt = `You are a transcript editor. Fix obvious transcription errors, spelling mistakes, and missing punctuation while preserving meaning, names, and sentence order. Do NOT summarize or remove content. Keep the structure and line breaks similar. Return only the corrected transcript.\n\nTranscript:\n${transcript}`;
+const aggressivePrompt = `You are a professional speech-to-text editor. Transform this raw transcript into polished, readable text.
+
+REMOVE completely:
+- Filler words and disfluencies (um, uh, like, you know, basically, actually, so, I mean, kind of, sort of, right, okay, well)
+- False starts, stutters, and repeated words
+- Verbal pauses and thinking sounds
+
+FIX:
+- Grammar and punctuation errors
+- Run-on sentences (split appropriately)
+- Missing capitalization
+- Obvious transcription errors (homophones, misheard words)
+
+PRESERVE:
+- All meaning and factual content
+- Proper nouns, names, and technical terms
+- Speaker intent and emphasis
+
+Return ONLY the cleaned transcript, nothing else.
+
+Raw transcript:
+${transcript}`;
+
+const polishPrompt = (text) => `Lightly polish the cleaned transcript for clarity and flow while preserving meaning and tone.
+- Keep all names, numbers, and technical terms unchanged
+- Avoid summarizing or adding content
+- Keep structure similar; do not over-formalize
+
+Text:
+${text}`;
 
 const client = new CopilotClient();
 await client.start();
@@ -45,11 +74,19 @@ try {
       });
     });
 
-    await session.send({ prompt });
+    await session.send({ prompt: aggressivePrompt });
     await done;
   } else {
-    const response = await session.sendAndWait({ prompt });
-    const content = response?.data?.content ?? "";
+    const response = await session.sendAndWait({ prompt: aggressivePrompt });
+    let content = response?.data?.content ?? "";
+
+    if (process.env.TWO_PASS === "1" && content.trim()) {
+      const polish = await session.sendAndWait({
+        prompt: polishPrompt(content.trim()),
+      });
+      content = polish?.data?.content ?? content;
+    }
+
     console.log(content.trim());
   }
 

@@ -73,7 +73,11 @@ async fn transcribe_audio(
             .arg(&wav_path)
             .arg("-otxt")
             .arg("-of")
-            .arg(&out_base);
+            .arg(&out_base)
+            .arg("--best-of")
+            .arg("5")
+            .arg("--beam-size")
+            .arg("5");
 
         let language = language.unwrap_or_else(|| config.language);
         if !language.trim().is_empty() {
@@ -778,19 +782,62 @@ fn resolve_model_path(input: &str) -> Result<PathBuf, String> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }
-    if path.is_dir() {
-        let direct = path.join("ggml-small.en.bin");
-        if direct.is_file() {
-            return Ok(direct);
-        }
-        let models_dir = path.join("models");
-        let in_models = models_dir.join("ggml-small.en.bin");
-        if in_models.is_file() {
-            return Ok(in_models);
+    // When given a directory, prefer a sensible default model if present.
+    // This keeps startup simple (point to the models folder) while allowing
+    // better tradeoffs than always picking the largest file.
+    let preferred_names = [
+        "ggml-medium.en-q8_0.bin",
+        "ggml-medium.en.bin",
+        "ggml-medium.en-q5_0.bin",
+        "ggml-medium-q8_0.bin",
+        "ggml-medium.bin",
+        "ggml-small.en-q8_0.bin",
+        "ggml-small.en.bin",
+        "ggml-base.en.bin",
+    ];
+
+    let search_dirs = if path.is_dir() {
+        vec![path.to_path_buf(), path.join("models")]
+    } else {
+        vec![]
+    };
+
+    let mut candidates: Vec<(PathBuf, u64, String)> = Vec::new();
+    for dir in search_dirs {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if !p.extension().map(|e| e == "bin").unwrap_or(false) {
+                    continue;
+                }
+                let size = match p.metadata() {
+                    Ok(meta) => meta.len(),
+                    Err(_) => continue,
+                };
+                let file_name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                candidates.push((p, size, file_name));
+            }
         }
     }
+
+    for preferred in preferred_names {
+        let preferred = preferred.to_ascii_lowercase();
+        if let Some((p, _, _)) = candidates.iter().find(|(_, _, name)| *name == preferred) {
+            return Ok(p.to_path_buf());
+        }
+    }
+
+    // Fallback: pick the largest .bin in the folder.
+    if let Some((p, _, _)) = candidates.into_iter().max_by_key(|(_, size, _)| *size) {
+        return Ok(p);
+    }
+
     Err(format!(
-        "Model not found. Provide a .bin file or a folder containing models/ggml-small.en.bin. Got: {}",
+        "Model not found. Provide a .bin file or a folder containing ggml-*.bin models. Got: {}",
         input
     ))
 }
