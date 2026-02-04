@@ -4,8 +4,16 @@ import { listen } from "@tauri-apps/api/event";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
 import "./App.css";
 
+// ============================================================================
+// Types
+// ============================================================================
+
 type RecorderHandle = {
   stop: () => Promise<Blob>;
+  getChunk: () => Promise<Blob | null>;
+  getFinalChunk: () => Promise<Blob | null>;
+  systemAudioActive: boolean;
+  mimeType: string;
 };
 
 type TranscribeResponse = {
@@ -13,14 +21,76 @@ type TranscribeResponse = {
   stdout: string;
   stderr: string;
   command: string;
+  provider: string;
+};
+
+type TranscriptionProvider = "local" | "openai-compatible" | "auto";
+
+type StreamingConfig = {
+  enabled: boolean;
+  chunkDurationMs: number;
+  overlapMs: number;
+};
+
+type LocalTranscriptionConfig = {
+  whisperPath: string;
+  modelPath: string;
+  modelName: string;
+  beamSize: number;
+  bestOf: number;
+};
+
+type OpenAICompatibleConfig = {
+  endpoint: string;
+  apiKey: string;
+  model: string;
+};
+
+type TranscriptionConfig = {
+  provider: TranscriptionProvider;
+  language: string;
+  streaming: StreamingConfig;
+  local: LocalTranscriptionConfig;
+  openaiCompatible: OpenAICompatibleConfig;
+};
+
+type AIConfig = {
+  defaultModel: string;
+};
+
+type ExportConfig = {
+  defaultFormat: string;
+  localPath: string;
+};
+
+type UIConfig = {
+  theme: string;
+  showDiagnostics: boolean;
+  includeSystemAudio: boolean;
 };
 
 type AppConfig = {
-  whisperPath: string;
-  modelPath: string;
-  language: string;
-  includeSystemAudio: boolean;
-  defaultModel: string;
+  version: number;
+  transcription: TranscriptionConfig;
+  ai: AIConfig;
+  export: ExportConfig;
+  ui: UIConfig;
+  // Legacy fields for backward compat
+  whisperPath?: string;
+  modelPath?: string;
+  language?: string;
+  includeSystemAudio?: boolean;
+  defaultModel?: string;
+};
+
+type ActionItem = {
+  id: string;
+  task: string;
+  assignee: string | null;
+  dueDate: string | null;
+  priority: "high" | "medium" | "low";
+  status: "pending" | "completed";
+  context: string | null;
 };
 
 type MeetingRecord = {
@@ -29,6 +99,7 @@ type MeetingRecord = {
   notes: string;
   transcript: string;
   summary: string;
+  actionItems: ActionItem[];
   createdAt: string;
   updatedAt: string;
 };
@@ -39,6 +110,10 @@ type SelectionState = {
   end: number;
 };
 
+// ============================================================================
+// Audio Recording
+// ============================================================================
+
 async function startRecorder(includeSystemAudio: boolean): Promise<RecorderHandle> {
   const micStream = await navigator.mediaDevices.getUserMedia({
     audio: true,
@@ -46,14 +121,22 @@ async function startRecorder(includeSystemAudio: boolean): Promise<RecorderHandl
   });
 
   let systemStream: MediaStream | null = null;
+  let systemAudioActive = false;
   if (includeSystemAudio) {
-    systemStream = await navigator.mediaDevices.getDisplayMedia({
-      audio: true,
-      video: true,
-    });
+    try {
+      systemStream = await navigator.mediaDevices.getDisplayMedia({
+        audio: true,
+        video: true,
+      });
 
-    for (const track of systemStream.getVideoTracks()) {
-      track.stop();
+      systemAudioActive = true;
+
+      for (const track of systemStream.getVideoTracks()) {
+        track.stop();
+      }
+    } catch {
+      // System audio capture failed, continue with mic only
+      console.warn("System audio capture not available");
     }
   }
 
@@ -72,29 +155,103 @@ async function startRecorder(includeSystemAudio: boolean): Promise<RecorderHandl
     systemSource.connect(systemGain).connect(destination);
   }
 
-  const mediaRecorder = new MediaRecorder(destination.stream, {
-    mimeType: "audio/webm",
-  });
+  const preferredTypes = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+  ];
+  const selectedType = preferredTypes.find((type) =>
+    MediaRecorder.isTypeSupported(type)
+  );
+  const createRecorder = () =>
+    selectedType
+      ? new MediaRecorder(destination.stream, { mimeType: selectedType })
+      : new MediaRecorder(destination.stream);
+
+  const fullRecorder = createRecorder();
+  const blobType = fullRecorder.mimeType || "audio/webm";
 
   const chunks: Blob[] = [];
-  mediaRecorder.ondataavailable = (event) => {
-    if (event.data.size > 0) chunks.push(event.data);
+
+  fullRecorder.ondataavailable = (event) => {
+    if (event.data.size > 0) {
+      chunks.push(event.data);
+    }
   };
 
-  mediaRecorder.start();
+  // Request data every second for streaming
+  fullRecorder.start(1000);
+
+  let streamRecorder: MediaRecorder | null = null;
+  let streamParts: Blob[] = [];
+  let streamChunkResolver: ((chunk: Blob | null) => void) | null = null;
+  let streamActive = false;
+  let streamWarmup = true;
+
+  const ensureStreamRecorder = () => {
+    if (streamRecorder) return;
+    streamRecorder = createRecorder();
+    streamRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        streamParts.push(event.data);
+      }
+    };
+    streamRecorder.onstop = () => {
+      const chunkType = streamRecorder?.mimeType || blobType;
+      const blob = streamParts.length
+        ? new Blob(streamParts, { type: chunkType })
+        : null;
+      streamParts = [];
+      const resolver = streamChunkResolver;
+      streamChunkResolver = null;
+      if (resolver) resolver(blob);
+      if (streamActive) {
+        streamRecorder.start();
+      }
+    };
+    streamActive = true;
+    streamRecorder.start();
+  };
 
   return {
     stop: () =>
       new Promise<Blob>((resolve) => {
-        mediaRecorder.onstop = () => {
-          const blob = new Blob(chunks, { type: "audio/webm" });
+        fullRecorder.onstop = () => {
+          const blob = new Blob(chunks, { type: blobType });
           micStream.getTracks().forEach((track) => track.stop());
           systemStream?.getTracks().forEach((track) => track.stop());
           audioContext.close();
           resolve(blob);
         };
-        mediaRecorder.stop();
+        fullRecorder.stop();
       }),
+    getChunk: async () => {
+      ensureStreamRecorder();
+      if (!streamRecorder) return null;
+      if (streamWarmup) {
+        streamWarmup = false;
+        return null;
+      }
+      if (streamRecorder.state !== "recording") return null;
+      if (streamChunkResolver) return null;
+      const chunkPromise = new Promise<Blob | null>((resolve) => {
+        streamChunkResolver = resolve;
+      });
+      streamRecorder.stop();
+      return chunkPromise;
+    },
+    getFinalChunk: async () => {
+      if (!streamRecorder) return null;
+      if (streamRecorder.state === "inactive") return null;
+      if (streamChunkResolver) return null;
+      streamActive = false;
+      const chunkPromise = new Promise<Blob | null>((resolve) => {
+        streamChunkResolver = resolve;
+      });
+      streamRecorder.stop();
+      return chunkPromise;
+    },
+    systemAudioActive,
+    mimeType: fullRecorder.mimeType || selectedType || "",
   };
 }
 
@@ -182,24 +339,37 @@ function uint8ToBase64(bytes: Uint8Array): string {
 }
 
 function App() {
+  // Config & Data
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [meetings, setMeetings] = useState<MeetingRecord[]>([]);
   const [activeMeetingId, setActiveMeetingId] = useState<string | null>(null);
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>("gpt-4.1");
+  const [localModelOptions, setLocalModelOptions] = useState<string[]>([]);
+  
+  // UI State
   const [status, setStatus] = useState("Idle");
   const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
   const [isSummarizing, setIsSummarizing] = useState(false);
   const [isCleaningTranscript, setIsCleaningTranscript] = useState(false);
   const [isEnhancingSelection, setIsEnhancingSelection] = useState(false);
+  const [isExtractingActions, setIsExtractingActions] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [isTranscriptCollapsed, setIsTranscriptCollapsed] = useState(false);
   const [selection, setSelection] = useState<SelectionState>({
     field: null,
     start: 0,
     end: 0,
   });
+  
+  // Live transcript during recording
+  const [liveTranscript, setLiveTranscript] = useState<string>("");
+  const [streamingSessionId, setStreamingSessionId] = useState<string | null>(null);
 
+  // Refs
   const recorderRef = useRef<RecorderHandle | null>(null);
   const activeMeetingRef = useRef<string | null>(null);
   const summaryStartRef = useRef<number | null>(null);
@@ -217,6 +387,11 @@ function App() {
   const notesRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLTextAreaElement | null>(null);
   const summaryRef = useRef<HTMLTextAreaElement | null>(null);
+  const recordingTimerRef = useRef<number | null>(null);
+  const streamingIntervalRef = useRef<number | null>(null);
+  const streamingChunkIndexRef = useRef<number>(0);
+  const streamingBusyRef = useRef<boolean>(false);
+  const pendingStreamingChunkRef = useRef<Blob | null>(null);
 
   const activeMeeting = useMemo(
     () => meetings.find((meeting) => meeting.id === activeMeetingId) || null,
@@ -286,6 +461,48 @@ function App() {
       })
       .catch(() => setModels(getFallbackModels()));
   }, []);
+
+  useEffect(() => {
+    if (!config) return;
+    const modelDir = config?.transcription?.local?.modelPath ?? "";
+    if (!modelDir.trim()) {
+      setLocalModelOptions([]);
+      return;
+    }
+
+    void invoke<string[]>("list_local_models", { modelDir })
+      .then((data) => {
+        const list = Array.isArray(data) ? data.filter(Boolean) : [];
+        setLocalModelOptions(list);
+      })
+      .catch((error) => {
+        appendLog(`Failed to list local models: ${String(error)}`);
+        setLocalModelOptions([]);
+      });
+  }, [config?.transcription?.local?.modelPath]);
+
+  useEffect(() => {
+    if (!config) return;
+    if (!localModelOptions.length) return;
+    const current = config?.transcription?.local?.modelName ?? "";
+    if (current && localModelOptions.includes(current)) return;
+
+    const next = localModelOptions[0];
+    const newConfig = {
+      ...config,
+      transcription: {
+        ...config.transcription,
+        local: {
+          ...config.transcription.local,
+          modelName: next,
+        },
+      },
+    };
+    setConfig(newConfig);
+    void invoke("save_config_command", { config: newConfig }).catch((error) =>
+      appendLog(`Failed to save model selection: ${String(error)}`)
+    );
+  }, [localModelOptions, config]);
 
   useEffect(() => {
     let isMounted = true;
@@ -496,6 +713,54 @@ function App() {
       appendLog(message);
     });
 
+    // Action items events
+    const unlistenActionsDone = listen("actions-done", (event) => {
+      const payload = event.payload as { 
+        meetingId: string; 
+        actions: { items: ActionItem[] } 
+      };
+      if (payload?.meetingId === activeMeetingRef.current) {
+        const items = payload.actions?.items || [];
+        updateActiveMeeting((meeting) => ({
+          ...meeting,
+          actionItems: items,
+          updatedAt: new Date().toISOString(),
+        }));
+        setIsExtractingActions(false);
+        setStatus("Idle");
+        appendLog(`Extracted ${items.length} action items.`);
+      }
+    });
+
+    const unlistenActionsError = listen("actions-error", (event) => {
+      const payload = event.payload as { meetingId: string; error: string };
+      if (payload?.meetingId === activeMeetingRef.current) {
+        setIsExtractingActions(false);
+        setStatus(payload.error || "Action extraction failed");
+        appendLog(payload.error || "Action extraction failed");
+      }
+    });
+
+    // Streaming transcription events
+    const unlistenTranscriptionChunk = listen("transcription-chunk", (event) => {
+      const payload = event.payload as {
+        sessionId: string;
+        chunkIndex: number;
+        text: string;
+        provider: string;
+      };
+      setLiveTranscript((prev) => prev + " " + payload.text);
+    });
+
+    const unlistenTranscriptionError = listen("transcription-error", (event) => {
+      const payload = event.payload as {
+        sessionId: string;
+        chunkIndex: number;
+        error: string;
+      };
+      appendLog(`Transcription chunk error: ${payload.error}`);
+    });
+
     return () => {
       void unlistenDelta.then((fn) => fn());
       void unlistenDone.then((fn) => fn());
@@ -507,6 +772,10 @@ function App() {
       void unlistenCleanDelta.then((fn) => fn());
       void unlistenCleanDone.then((fn) => fn());
       void unlistenCleanError.then((fn) => fn());
+      void unlistenActionsDone.then((fn) => fn());
+      void unlistenActionsError.then((fn) => fn());
+      void unlistenTranscriptionChunk.then((fn) => fn());
+      void unlistenTranscriptionError.then((fn) => fn());
     };
   }, []);
 
@@ -525,9 +794,27 @@ function App() {
       notes: "",
       transcript: "",
       summary: "",
+      actionItems: [],
       createdAt: now,
       updatedAt: now,
     };
+  }
+
+  // Helper to get effective config values (handles legacy config)
+  function getEffectiveWhisperPath(): string {
+    if (!config) return "";
+    return config.transcription?.local?.whisperPath || config.whisperPath || "";
+  }
+
+  function getEffectiveModelPath(): string {
+    if (!config) return "";
+    return config.transcription?.local?.modelPath || config.modelPath || "";
+  }
+
+  function isTranscriptionConfigured(): boolean {
+    const localConfigured = getEffectiveWhisperPath() && getEffectiveModelPath();
+    const cloudConfigured = config?.transcription?.openaiCompatible?.apiKey;
+    return !!(localConfigured || cloudConfigured);
   }
 
   function updateActiveMeeting(updater: (meeting: MeetingRecord) => MeetingRecord) {
@@ -634,17 +921,73 @@ function App() {
 
   async function handleStart() {
     if (isRecording) return;
-    if (!config || !config.whisperPath || !config.modelPath) {
-      setStatus("Missing config values (whisper/model)");
-      appendLog("Missing config values. Update config.json in app data.");
+    if (!isTranscriptionConfigured()) {
+      setStatus("Transcription not configured");
+      appendLog("Configure transcription in settings (local whisper or cloud API).");
+      setSettingsOpen(true);
       return;
     }
     setStatus("Requesting audio sources...");
     try {
-      recorderRef.current = await startRecorder(config.includeSystemAudio);
+      const includeSystem = config?.ui?.includeSystemAudio ?? false;
+      recorderRef.current = await startRecorder(includeSystem);
+      if (includeSystem && recorderRef.current && !recorderRef.current.systemAudioActive) {
+        appendLog("System audio capture not available; continuing with mic only.");
+      }
+      if (recorderRef.current?.mimeType) {
+        appendLog(`Recorder mime: ${recorderRef.current.mimeType}`);
+      }
       setIsRecording(true);
+      setRecordingTime(0);
+      setLiveTranscript("");
       setStatus("Recording...");
       appendLog("Recording started.");
+
+      // Start recording timer
+      recordingTimerRef.current = window.setInterval(() => {
+        setRecordingTime((t) => t + 1);
+      }, 1000);
+
+      // Start streaming transcription if enabled
+      if (config?.transcription?.streaming?.enabled) {
+        try {
+          const sessionId = await invoke<string>("start_streaming_session", {
+            provider: config.transcription.provider,
+          });
+          setStreamingSessionId(sessionId);
+          streamingChunkIndexRef.current = 0;
+          appendLog(`Streaming session started: ${sessionId}`);
+
+          const intervalMs = Math.max(
+            1000,
+            config.transcription.streaming?.chunkDurationMs ?? 5000
+          );
+          streamingIntervalRef.current = window.setInterval(async () => {
+            if (streamingBusyRef.current) return;
+            if (!recorderRef.current) return;
+            if (!sessionId) return;
+            try {
+              streamingBusyRef.current = true;
+              const chunk = await recorderRef.current.getChunk();
+              if (!chunk) return;
+              const audioBase64 = await blobToWavBase64(chunk);
+              const chunkIndex = streamingChunkIndexRef.current;
+              streamingChunkIndexRef.current += 1;
+              await invoke("transcribe_chunk", {
+                sessionId,
+                audioBase64,
+                chunkIndex,
+              });
+            } catch (err) {
+              appendLog(`Streaming chunk failed: ${String(err)}`);
+            } finally {
+              streamingBusyRef.current = false;
+            }
+          }, intervalMs);
+        } catch (err) {
+          appendLog(`Streaming not available: ${err}`);
+        }
+      }
     } catch (error) {
       const message =
         error instanceof Error
@@ -659,36 +1002,110 @@ function App() {
   }
 
   async function handleStop() {
-    if (!recorderRef.current) return;
+    const recorder = recorderRef.current;
+    if (!recorder) return;
     setStatus("Finalizing audio...");
     setIsRecording(false);
+    
+    // Stop recording timer
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    
+    // Stop streaming interval
+    if (streamingIntervalRef.current) {
+      clearInterval(streamingIntervalRef.current);
+      streamingIntervalRef.current = null;
+    }
+    streamingBusyRef.current = false;
 
     try {
-      const blob = await recorderRef.current.stop();
+      const blob = await recorder.stop();
       recorderRef.current = null;
       setStatus("Preparing transcription...");
-      appendLog(`Recording stopped. Audio size: ${blob.size} bytes.`);
+      appendLog(`Recording stopped. Audio size: ${blob.size} bytes. Duration: ${recordingTime}s`);
 
-      const audioBase64 = await blobToWavBase64(blob);
-      setStatus("Transcribing with whisper.cpp...");
-      appendLog("Sending audio to whisper.cpp...");
+      // Flush any remaining streaming audio before ending the session
+      if (config?.transcription?.streaming?.enabled && streamingSessionId) {
+        await waitForStreamingIdle(1500);
+        try {
+          const pending = pendingStreamingChunkRef.current;
+          const finalChunk = await recorder.getFinalChunk();
+          const chunkType =
+            pending?.type || finalChunk?.type || recorder.mimeType || "audio/webm";
+          const combined = pending && finalChunk
+            ? new Blob([pending, finalChunk], { type: chunkType })
+            : pending || finalChunk;
+          pendingStreamingChunkRef.current = null;
+          if (combined) {
+            const audioBase64 = await blobToWavBase64(combined);
+            const chunkIndex = streamingChunkIndexRef.current;
+            streamingChunkIndexRef.current += 1;
+            await invoke("transcribe_chunk", {
+              sessionId: streamingSessionId,
+              audioBase64,
+              chunkIndex,
+            });
+          }
+        } catch (err) {
+          appendLog(`Final streaming chunk failed: ${String(err)}`);
+        }
+      }
 
-      const result = await invoke<TranscribeResponse>("transcribe_audio", {
-        audioBase64,
-        language: config?.language ?? "en",
-      });
+      // End streaming session if active
+      let mergedTranscript = "";
+      if (streamingSessionId) {
+        try {
+          mergedTranscript = await invoke<string>("end_streaming_session", {
+            sessionId: streamingSessionId,
+          });
+        } catch {
+          // Ignore cleanup errors
+        }
+        setStreamingSessionId(null);
+      }
 
-      appendLog(`Command: ${result.command}`);
-      if (result.stdout.trim()) appendLog(`stdout: ${result.stdout.trim()}`);
-      if (result.stderr.trim()) appendLog(`stderr: ${result.stderr.trim()}`);
+      const streamingEnabled = config?.transcription?.streaming?.enabled ?? false;
+      const mergedText = mergedTranscript.trim();
+      const liveText = liveTranscript.trim();
+      const shouldUseStreaming = streamingEnabled && (mergedText || liveText);
 
+      let finalTranscript = "";
+
+      if (shouldUseStreaming) {
+        finalTranscript = mergedText || liveText;
+        appendLog("Using streaming transcript; skipping batch transcription.");
+      } else {
+        const audioBase64 = await blobToWavBase64(blob);
+        const provider = config?.transcription?.provider || "local";
+        setStatus(`Transcribing (${provider})...`);
+        appendLog(`Sending audio to transcription provider: ${provider}`);
+
+        const result = await invoke<TranscribeResponse>("transcribe_audio", {
+          audioBase64,
+          language: config?.transcription?.language ?? "en",
+        });
+
+        appendLog(`Provider: ${result.provider}`);
+        appendLog(`Command: ${result.command}`);
+        if (result.stdout.trim()) appendLog(`stdout: ${result.stdout.trim()}`);
+        if (result.stderr.trim()) appendLog(`stderr: ${result.stderr.trim()}`);
+
+        finalTranscript = result.transcript.trim();
+      }
+      
       updateActiveMeeting((meeting) => ({
         ...meeting,
         transcript: meeting.transcript
-          ? `${meeting.transcript}\n${result.transcript}`
-          : result.transcript,
+          ? `${meeting.transcript}\n${finalTranscript}`
+          : finalTranscript,
         updatedAt: new Date().toISOString(),
       }));
+      
+      setLiveTranscript("");
+      setRecordingTime(0);
+      streamingChunkIndexRef.current = 0;
       setStatus("Idle");
     } catch (error) {
       const message =
@@ -699,6 +1116,154 @@ function App() {
             : "Transcription failed";
       setStatus(message);
       appendLog(message);
+    }
+  }
+
+  async function handleExtractActions() {
+    if (!activeMeeting) return;
+    if (!activeMeeting.transcript.trim() && !activeMeeting.notes.trim()) {
+      appendLog("Action extraction blocked: transcript and notes are empty.");
+      return;
+    }
+    
+    setIsExtractingActions(true);
+    setStatus("Extracting action items...");
+    appendLog("Starting action items extraction...");
+    
+    try {
+      await invoke("extract_action_items", {
+        meetingId: activeMeeting.id,
+        transcript: activeMeeting.transcript,
+        notes: activeMeeting.notes,
+        model: selectedModel,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Action extraction failed";
+      setStatus(message);
+      appendLog(message);
+      setIsExtractingActions(false);
+    }
+  }
+
+  async function handleExportMarkdown() {
+    if (!activeMeeting) return;
+    
+    setStatus("Exporting markdown...");
+    try {
+      const path = await invoke<string>("export_meeting_markdown", {
+        meeting: activeMeeting,
+        includeTranscript: true,
+      });
+      setStatus("Exported!");
+      appendLog(`Exported to: ${path}`);
+      setTimeout(() => setStatus("Idle"), 2000);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Export failed";
+      setStatus(message);
+      appendLog(message);
+    }
+  }
+
+  function toggleActionItem(itemId: string) {
+    updateActiveMeeting((meeting) => ({
+      ...meeting,
+      actionItems: meeting.actionItems.map((item) =>
+        item.id === itemId
+          ? { ...item, status: item.status === "completed" ? "pending" : "completed" }
+          : item
+      ),
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  function buildMeetingMarkdown(meeting: MeetingRecord): string {
+    const lines: string[] = [];
+    lines.push(`# ${meeting.title || "Untitled meeting"}`);
+    lines.push(`**Date:** ${meeting.createdAt}`);
+    lines.push(`**Last Updated:** ${meeting.updatedAt}`);
+    lines.push("");
+
+    if (meeting.summary.trim()) {
+      lines.push("## Summary");
+      lines.push(meeting.summary.trim());
+      lines.push("");
+    }
+
+    if (meeting.actionItems.length) {
+      lines.push("## Action Items");
+      for (const item of meeting.actionItems) {
+        const checkbox = item.status === "completed" ? "[x]" : "[ ]";
+        const assignee = item.assignee ? `**${item.assignee}**: ` : "";
+        const due = item.dueDate ? ` (due: ${item.dueDate})` : "";
+        lines.push(`- ${checkbox} ${assignee}${item.task}${due}`);
+      }
+      lines.push("");
+    }
+
+    if (meeting.notes.trim()) {
+      lines.push("## Notes");
+      lines.push(meeting.notes.trim());
+      lines.push("");
+    }
+
+    if (meeting.transcript.trim()) {
+      lines.push("## Transcript");
+      lines.push(meeting.transcript.trim());
+      lines.push("");
+    }
+
+    lines.push("---");
+    lines.push("*Generated by Voxii*");
+    return lines.join("\n");
+  }
+
+  async function handleCopyMarkdown() {
+    if (!activeMeeting) return;
+    const markdown = buildMeetingMarkdown(activeMeeting).trim();
+    if (!markdown) {
+      setStatus("Nothing to copy");
+      appendLog("Copy blocked: meeting content is empty.");
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(markdown);
+      setStatus("Copied markdown");
+      appendLog("Markdown copied to clipboard.");
+      setTimeout(() => setStatus("Idle"), 1500);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "Copy failed";
+      setStatus(message);
+      appendLog(message);
+    }
+  }
+
+  function formatTime(seconds: number): string {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+  }
+
+  async function waitForStreamingIdle(timeoutMs: number) {
+    const start = Date.now();
+    while (streamingBusyRef.current) {
+      if (Date.now() - start > timeoutMs) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
   }
 
@@ -746,7 +1311,7 @@ function App() {
   }
 
   async function handleDiagnostics() {
-    if (!config?.whisperPath.trim()) {
+    if (!config?.transcription?.local?.whisperPath?.trim()) {
       appendLog("Diagnostics failed: whisper binary path is empty.");
       return;
     }
@@ -754,7 +1319,7 @@ function App() {
     setStatus("Running diagnostics...");
     try {
       const result = await invoke<string>("diagnose_whisper", {
-        whisperPath: config.whisperPath,
+        whisperPath: config.transcription.local.whisperPath,
       });
       appendLog("Diagnostics result:\n" + result);
       setStatus("Idle");
@@ -826,18 +1391,144 @@ function App() {
         </header>
 
         <section className="record-bar">
-          <button
-            className={`primary ${isRecording ? "danger" : ""}`}
-            onClick={isRecording ? handleStop : handleStart}
-          >
-            {isRecording ? "Stop listening" : "Start listening"}
-          </button>
+          <div className="record-controls">
+            <button
+              className={`primary ${isRecording ? "danger" : ""}`}
+              onClick={isRecording ? handleStop : handleStart}
+            >
+              {isRecording ? "Stop listening" : "Start listening"}
+            </button>
+            {config?.transcription?.provider !== "openai-compatible" && (
+              <select
+                className="model-select"
+                value={config?.transcription?.local?.modelName ?? ""}
+                disabled={!localModelOptions.length || isRecording}
+                onChange={(event) => {
+                  if (!config) return;
+                  const newConfig = {
+                    ...config,
+                    transcription: {
+                      ...config.transcription,
+                      local: {
+                        ...config.transcription.local,
+                        modelName: event.target.value,
+                      },
+                    },
+                  };
+                  setConfig(newConfig);
+                  void invoke("save_config_command", { config: newConfig }).catch(
+                    (error) =>
+                      appendLog(`Failed to save model selection: ${String(error)}`)
+                  );
+                }}
+                title="Local Whisper model"
+              >
+                {!localModelOptions.length && (
+                  <option value="">No models found</option>
+                )}
+                {localModelOptions.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+              </select>
+            )}
+            {config && (
+              <label className="capture-toggle" title="Include system audio in the recording">
+                <input
+                  type="checkbox"
+                  checked={Boolean(config?.ui?.includeSystemAudio)}
+                  disabled={isRecording}
+                  onChange={async (event) => {
+                    const next = event.target.checked;
+                    const newConfig = {
+                      ...config,
+                      ui: {
+                        ...config.ui,
+                        includeSystemAudio: next,
+                      },
+                    };
+                    setConfig(newConfig);
+                    try {
+                      await invoke("save_config_command", { config: newConfig });
+                    } catch (error) {
+                      appendLog(`Failed to save capture setting: ${String(error)}`);
+                    }
+                  }}
+                />
+                <span>System audio</span>
+              </label>
+            )}
+            {config && (
+              <label className="capture-toggle" title="Enable live transcription during recording">
+                <input
+                  type="checkbox"
+                  checked={config?.transcription?.streaming?.enabled ?? true}
+                  disabled={isRecording}
+                  onChange={async (event) => {
+                    const next = event.target.checked;
+                    const newConfig = {
+                      ...config,
+                      transcription: {
+                        ...config.transcription,
+                        streaming: {
+                          ...config.transcription.streaming,
+                          enabled: next,
+                        },
+                      },
+                    };
+                    setConfig(newConfig);
+                    try {
+                      await invoke("save_config_command", { config: newConfig });
+                    } catch (error) {
+                      appendLog(`Failed to save streaming toggle: ${String(error)}`);
+                    }
+                  }}
+                />
+                <span>Live transcript</span>
+              </label>
+            )}
+            {isRecording && (
+              <span className="recording-timer">{formatTime(recordingTime)}</span>
+            )}
+          </div>
+          <div className="record-actions">
+            <button
+              className="ghost"
+              onClick={() => setSettingsOpen(true)}
+              title="Settings"
+            >
+              ⚙️ Settings
+            </button>
+            <button
+              className="ghost"
+              onClick={handleExportMarkdown}
+              disabled={!activeMeeting?.summary?.trim()}
+              title="Export as Markdown"
+            >
+              📄 Export
+            </button>
+          </div>
           <div className="record-hint">
-            {config?.includeSystemAudio
+            {config?.ui?.includeSystemAudio
               ? "System + mic capture enabled (configured)."
               : "Mic-only capture (configured)."}
           </div>
         </section>
+
+        {isRecording && liveTranscript && (
+          <section className="panel live-transcript-panel">
+            <div className="panel-header">
+              <h2>
+                <span className="live-indicator" />
+                Live Transcript
+              </h2>
+            </div>
+            <div className="live-transcript-body">
+              {liveTranscript}
+            </div>
+          </section>
+        )}
 
         <section className="panel">
           <div className="panel-header">
@@ -867,7 +1558,7 @@ function App() {
           />
         </section>
 
-        <section className="panel">
+        <section className={`panel ${isTranscriptCollapsed ? "panel--collapsed" : ""}`}>
           <div className="panel-header">
             <h2>Transcript</h2>
             <div className="panel-actions">
@@ -892,21 +1583,31 @@ function App() {
               >
                 Enhance selection
               </button>
+              <button
+                className="ghost"
+                onClick={() => setIsTranscriptCollapsed((prev) => !prev)}
+              >
+                {isTranscriptCollapsed ? "Show transcript" : "Collapse"}
+              </button>
             </div>
           </div>
-          <textarea
-            ref={transcriptRef}
-            value={activeMeeting?.transcript ?? ""}
-            onChange={(event) =>
-              updateActiveMeeting((meeting) => ({
-                ...meeting,
-                transcript: event.target.value,
-                updatedAt: new Date().toISOString(),
-              }))
-            }
-            onSelect={(event) => handleSelect("transcript", event)}
-            placeholder="Transcript will appear here..."
-          />
+          {isTranscriptCollapsed ? (
+            <div className="panel-collapsed">Transcript hidden.</div>
+          ) : (
+            <textarea
+              ref={transcriptRef}
+              value={activeMeeting?.transcript ?? ""}
+              onChange={(event) =>
+                updateActiveMeeting((meeting) => ({
+                  ...meeting,
+                  transcript: event.target.value,
+                  updatedAt: new Date().toISOString(),
+                }))
+              }
+              onSelect={(event) => handleSelect("transcript", event)}
+              placeholder="Transcript will appear here..."
+            />
+          )}
         </section>
 
         <section
@@ -979,6 +1680,72 @@ function App() {
           </div>
         </section>
 
+        <section className={`panel action-items-panel ${isExtractingActions ? "action-items-panel--loading" : ""}`}>
+          <div className="panel-header">
+            <div>
+              <h2>Action Items</h2>
+              {isExtractingActions ? (
+                <span className="pill">Extracting actions…</span>
+              ) : activeMeeting?.actionItems?.length ? (
+                <span className="pill">{activeMeeting.actionItems.length} items</span>
+              ) : null}
+            </div>
+            <div className="panel-actions">
+              <button
+                className="primary"
+                onClick={handleExtractActions}
+                disabled={isExtractingActions || isSummarizing || !activeMeeting?.transcript?.trim()}
+              >
+                Extract actions
+              </button>
+            </div>
+          </div>
+          <div className="action-items-body">
+            {activeMeeting?.actionItems?.length ? (
+              <ul className="action-items-list">
+                {activeMeeting.actionItems.map((item) => (
+                  <li
+                    key={item.id}
+                    className={`action-item ${item.status === "completed" ? "action-item--completed" : ""}`}
+                  >
+                    <label className="action-item-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={item.status === "completed"}
+                        onChange={() => toggleActionItem(item.id)}
+                      />
+                      <span className="checkmark" />
+                    </label>
+                    <div className="action-item-content">
+                      <div className="action-item-task">{item.task}</div>
+                      <div className="action-item-meta">
+                        {item.assignee && (
+                          <span className="action-item-assignee">👤 {item.assignee}</span>
+                        )}
+                        {item.dueDate && (
+                          <span className="action-item-due">📅 {item.dueDate}</span>
+                        )}
+                        {item.priority && (
+                          <span className={`action-item-priority priority-${item.priority.toLowerCase()}`}>
+                            {item.priority}
+                          </span>
+                        )}
+                      </div>
+                      {item.context && (
+                        <div className="action-item-context">{item.context}</div>
+                      )}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="action-items-empty">
+                No action items yet. Click "Extract actions" after generating a summary.
+              </div>
+            )}
+          </div>
+        </section>
+
         <section className={`panel diagnostics ${diagnosticsOpen ? "open" : ""}`}>
           <div className="panel-header">
             <button
@@ -1003,11 +1770,217 @@ function App() {
               placeholder="Logs will appear here..."
             />
             <div className="config-hint">
-              Config: {config?.whisperPath ? "Loaded" : "Missing"}
+              Config: {config?.transcription?.local?.whisperPath ? "Loaded" : "Missing"}
             </div>
           </div>
         </section>
       </section>
+
+      {settingsOpen && (
+        <div className="settings-overlay" onClick={() => setSettingsOpen(false)}>
+          <div className="settings-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="settings-header">
+              <h2>Settings</h2>
+              <button className="ghost" onClick={() => setSettingsOpen(false)}>✕</button>
+            </div>
+            <div className="settings-body">
+              <section className="settings-section">
+                <h3>Transcription</h3>
+                <div className="settings-field">
+                  <label>Provider</label>
+                  <select
+                    value={config?.transcription?.provider ?? "local"}
+                    onChange={(e) => {
+                      const newConfig = {
+                        ...config,
+                        transcription: {
+                          ...config?.transcription,
+                          provider: e.target.value as TranscriptionProvider,
+                        },
+                      };
+                      setConfig(newConfig as AppConfig);
+                    }}
+                  >
+                    <option value="local">Local (whisper.cpp)</option>
+                    <option value="openai-compatible">OpenAI Compatible API</option>
+                    <option value="auto">Auto (local → cloud fallback)</option>
+                  </select>
+                </div>
+                {(config?.transcription?.provider === "openai-compatible" || config?.transcription?.provider === "auto") && (
+                  <>
+                    <div className="settings-field">
+                      <label>API Endpoint</label>
+                      <input
+                        type="text"
+                        value={config?.transcription?.openaiCompatible?.endpoint ?? "https://api.openai.com/v1/audio/transcriptions"}
+                        onChange={(e) => {
+                          const newConfig = {
+                            ...config,
+                            transcription: {
+                              ...config?.transcription,
+                              openaiCompatible: {
+                                ...config?.transcription?.openaiCompatible,
+                                endpoint: e.target.value,
+                              },
+                            },
+                          };
+                          setConfig(newConfig as AppConfig);
+                        }}
+                        placeholder="https://api.openai.com/v1/audio/transcriptions"
+                      />
+                    </div>
+                    <div className="settings-field">
+                      <label>API Key</label>
+                      <input
+                        type="password"
+                        value={config?.transcription?.openaiCompatible?.apiKey ?? ""}
+                        onChange={(e) => {
+                          const newConfig = {
+                            ...config,
+                            transcription: {
+                              ...config?.transcription,
+                              openaiCompatible: {
+                                ...config?.transcription?.openaiCompatible,
+                                apiKey: e.target.value,
+                              },
+                            },
+                          };
+                          setConfig(newConfig as AppConfig);
+                        }}
+                        placeholder="sk-..."
+                      />
+                    </div>
+                    <div className="settings-field">
+                      <label>Model</label>
+                      <input
+                        type="text"
+                        value={config?.transcription?.openaiCompatible?.model ?? "whisper-1"}
+                        onChange={(e) => {
+                          const newConfig = {
+                            ...config,
+                            transcription: {
+                              ...config?.transcription,
+                              openaiCompatible: {
+                                ...config?.transcription?.openaiCompatible,
+                                model: e.target.value,
+                              },
+                            },
+                          };
+                          setConfig(newConfig as AppConfig);
+                        }}
+                        placeholder="whisper-1"
+                      />
+                    </div>
+                  </>
+                )}
+              </section>
+
+              <section className="settings-section">
+                <h3>Export</h3>
+                <div className="settings-field">
+                  <label>Default Export Path</label>
+                  <input
+                    type="text"
+                    value={config?.export?.localPath ?? ""}
+                    onChange={(e) => {
+                      const newConfig = {
+                        ...config,
+                        export: {
+                          ...config?.export,
+                          localPath: e.target.value,
+                        },
+                      };
+                      setConfig(newConfig as AppConfig);
+                    }}
+                    placeholder="~/Documents/voxii-meetings"
+                  />
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <h3>Local Whisper</h3>
+                <div className="settings-field">
+                  <label>Whisper Binary Path</label>
+                  <input
+                    type="text"
+                    value={config?.transcription?.local?.whisperPath ?? ""}
+                    onChange={(e) => {
+                      const newConfig = {
+                        ...config,
+                        transcription: {
+                          ...config?.transcription,
+                          local: {
+                            ...config?.transcription?.local,
+                            whisperPath: e.target.value,
+                          },
+                        },
+                      };
+                      setConfig(newConfig as AppConfig);
+                    }}
+                    placeholder="Path to whisper binary"
+                  />
+                </div>
+                <div className="settings-field">
+                  <label>Models Folder Path</label>
+                  <input
+                    type="text"
+                    value={config?.transcription?.local?.modelPath ?? ""}
+                    onChange={(e) => {
+                      const newConfig = {
+                        ...config,
+                        transcription: {
+                          ...config?.transcription,
+                          local: {
+                            ...config?.transcription?.local,
+                            modelPath: e.target.value,
+                            modelName: "",
+                          },
+                        },
+                      };
+                      setConfig(newConfig as AppConfig);
+                    }}
+                    placeholder="Path to Whisper models folder"
+                  />
+                </div>
+                <div className="settings-field">
+                  <label>Language</label>
+                  <input
+                    type="text"
+                    value={config?.transcription?.language ?? "en"}
+                    onChange={(e) => {
+                      const newConfig = {
+                        ...config,
+                        transcription: {
+                          ...config?.transcription,
+                          language: e.target.value,
+                        },
+                      };
+                      setConfig(newConfig as AppConfig);
+                    }}
+                    placeholder="en"
+                  />
+                </div>
+              </section>
+            </div>
+            <div className="settings-footer">
+              <button className="ghost" onClick={() => setSettingsOpen(false)}>
+                Cancel
+              </button>
+              <button
+                className="primary"
+                onClick={async () => {
+                  if (config) {
+                    await invoke("save_config_command", { config });
+                    setSettingsOpen(false);
+                  }
+                }}
+              >
+                Save Settings
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

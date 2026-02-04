@@ -65,3 +65,31 @@ npm run build
 - Transcripts are appended to the current meeting.
 - Use **Generate summary** to stream a Markdown summary into the Summary panel.
 - Use **Enhance selection** to refine selected text with your chosen model.
+
+## Docs, PRD, and Memory System
+
+This repo separates **spec** from **execution tracking** so the PRD stays clean and the work history is easy to maintain.
+
+### Canonical Docs
+
+- Spec (source of truth): [docs/PRD.md](docs/PRD.md)
+- Working progress: [docs/working/PROGRESS.md](docs/working/PROGRESS.md)
+- Task tracking: [docs/working/TASKS.md](docs/working/TASKS.md)
+- Decision log: [docs/working/DECISIONS.md](docs/working/DECISIONS.md)
+- Learnings: [docs/working/LEARNINGS.md](docs/working/LEARNINGS.md)
+- Session notes: [docs/working/sessions/](docs/working/sessions/)
+- Contributor/agent guide: [AGENTS.md](AGENTS.md)
+
+### Workflow (End of Session)
+
+1. Update [docs/working/sessions/](docs/working/sessions/) with a short session summary.
+2. Update [docs/working/TASKS.md](docs/working/TASKS.md) (status, dependencies, and session link).
+3. Update [docs/working/PROGRESS.md](docs/working/PROGRESS.md) (session bullet + next actions).
+4. If you made a pivot or contract change, append to [docs/working/DECISIONS.md](docs/working/DECISIONS.md).
+5. If you learned something reusable, append to [docs/working/LEARNINGS.md](docs/working/LEARNINGS.md).
+
+### Rules of Thumb
+
+- Keep PRD spec-only: no TODOs, progress logs, or session notes.
+- TASKS is the single source of truth for execution work.
+- Dependencies are only for real blockers.
